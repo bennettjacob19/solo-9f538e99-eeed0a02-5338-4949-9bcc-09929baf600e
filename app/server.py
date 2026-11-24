@@ -7,7 +7,7 @@ import sqlite3
 from flask import (Flask, abort, flash, jsonify, redirect, render_template,
                    request, url_for)
 
-from . import db, migration
+from . import db, migration, trial
 
 BLOCK_SIZE = db.BLOCK_SIZE
 
@@ -130,6 +130,83 @@ def create_app(db_path: str | None = None) -> Flask:
         flash("卷已重置为初始单块交替布局", "ok")
         return redirect(url_for("index"))
 
+    # ------------------------------------------------------------- trial pages
+    def _parse_patch_text(text: str) -> list[dict]:
+        """Parse one ``offset:hex`` pair per line (blank/``#`` lines ignored)."""
+        patches: list[dict] = []
+        for lineno, raw_line in enumerate((text or "").splitlines(), 1):
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if ":" not in line:
+                raise ValueError(f"第 {lineno} 行格式应为 偏移:十六进制")
+            off_text, hex_text = line.split(":", 1)
+            patches.append({"offset": off_text.strip(), "hex": hex_text.strip()})
+        if not patches:
+            raise ValueError("至少填写一行 偏移:十六进制 补丁")
+        return patches
+
+    @app.post("/trial/open")
+    def trial_open_page():
+        conn = get_conn()
+        try:
+            trial.open_round(conn)
+        except Exception as exc:  # noqa: BLE001
+            flash(str(exc), "err")
+        else:
+            flash("已开启一轮试写：同一时间只此一轮，确认或撤销后才能再开", "ok")
+        finally:
+            conn.close()
+        return redirect(url_for("index"))
+
+    @app.post("/trial/patch")
+    def trial_patch_page():
+        try:
+            lbn = _parse_int(request.form.get("lbn"), "逻辑块号", 0, db.BLOCK_COUNT - 1)
+            patches = _parse_patch_text(request.form.get("patches", ""))
+            conn = get_conn()
+            try:
+                r = trial.submit_patch(conn, lbn, patches)
+            finally:
+                conn.close()
+            flash(
+                f"试写已落到 LBN {lbn}（{r['target']}），原入口即刻读到新值；"
+                f"本笔 {r['byte_positions']} 个位置（新增 {r['new_positions']}），"
+                f"本轮累计可撤销 {r['round_positions']}/{r['position_limit']} 个位置，"
+                f"另存 {r['stored_bytes']}/{r['stored_budget']} 字节",
+                "ok",
+            )
+        except Exception as exc:  # noqa: BLE001
+            flash(f"试写整笔拒绝：{exc}", "err")
+        return redirect(url_for("index"))
+
+    @app.post("/trial/finalize")
+    def trial_finalize_page():
+        try:
+            confirm = request.form.get("action") == "confirm"
+            conn = get_conn()
+            try:
+                r = trial.finalize(conn, confirm=confirm)
+            finally:
+                conn.close()
+            if confirm:
+                flash(
+                    f"已确认整轮：涉及 {r['affected_blocks']} 个块，"
+                    f"盘槽正文写 0 次、临时槽正文写 0 次（试写值本就在正文中）",
+                    "ok",
+                )
+            else:
+                flash(
+                    f"已撤销整轮：涉及 {r['affected_blocks']} 个块，"
+                    f"正文实际写 {r['body_writes']} 次"
+                    f"（盘槽 {r['disk_slot_writes']} 次、临时槽 {r['staging_writes']} 次），"
+                    f"恢复 {r['positions']} 个字节位置",
+                    "ok",
+                )
+        except Exception as exc:  # noqa: BLE001
+            flash(f"收尾失败，整轮保持原状：{exc}", "err")
+        return redirect(url_for("index"))
+
     # ------------------------------------------------------------- JSON / API
     @app.get("/api/snapshot")
     def api_snapshot():
@@ -206,6 +283,56 @@ def create_app(db_path: str | None = None) -> Flask:
             conn = get_conn()
             try:
                 r = migration.write_lbn(conn, lbn, body)
+            finally:
+                conn.close()
+            return jsonify(ok=True, **r)
+        except Exception as exc:  # noqa: BLE001
+            return jsonify(ok=False, error=str(exc)), 400
+
+    @app.get("/api/trial")
+    def api_trial_status():
+        conn = get_conn()
+        try:
+            return jsonify(trial.round_snapshot(conn))
+        finally:
+            conn.close()
+
+    @app.post("/api/trial/open")
+    def api_trial_open():
+        conn = get_conn()
+        try:
+            trial.open_round(conn)
+            return jsonify(ok=True, **trial.round_snapshot(conn))
+        except Exception as exc:  # noqa: BLE001
+            return jsonify(ok=False, error=str(exc)), 400
+        finally:
+            conn.close()
+
+    @app.post("/api/trial/patch")
+    def api_trial_patch():
+        data = request.get_json(silent=True) or {}
+        try:
+            lbn = int(data.get("lbn"))
+            if not 0 <= lbn < db.BLOCK_COUNT:
+                raise ValueError("lbn out of range")
+            patches = data.get("patches")
+            conn = get_conn()
+            try:
+                r = trial.submit_patch(conn, lbn, patches)
+            finally:
+                conn.close()
+            return jsonify(ok=True, **r)
+        except Exception as exc:  # noqa: BLE001
+            return jsonify(ok=False, error=str(exc)), 400
+
+    @app.post("/api/trial/finalize")
+    def api_trial_finalize():
+        data = request.get_json(silent=True) or {}
+        try:
+            confirm = bool(data.get("confirm", True))
+            conn = get_conn()
+            try:
+                r = trial.finalize(conn, confirm=confirm)
             finally:
                 conn.close()
             return jsonify(ok=True, **r)

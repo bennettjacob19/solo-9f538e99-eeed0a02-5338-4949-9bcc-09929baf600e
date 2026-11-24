@@ -116,9 +116,57 @@
     <form method="post" action="{{ url_for('write_page') }}">
       <input type="number" name="lbn" min="0" max="31" placeholder="LBN" required>
       <input type="text" name="body" placeholder="改写正文（不足 4KiB 自动补零，超长截断）">
-      <button type="submit">改写并提交</button>
+      <button type="submit">整块改写并提交</button>
     </form>
-    <p class="note">值班员改写独立提交、立即生效，不占用搬运批次的写入额度；即使该块正在临时槽中也能读到最新内容。</p>
+    <p class="note">值班员整块改写独立提交、立即生效，不占用搬运批次的写入额度；即使该块正在临时槽中也能读到最新内容。整块改写成功后，该块此前的试写立即失效并腾出额度。</p>
+  </div>
+
+  {% set tr = state.trial %}
+  {% set tro = tr.round %}
+  <div class="card">
+    <h2 style="margin-top:0">试写轮次（先试写核对，再整轮确认 / 撤销）</h2>
+    {% if tro %}
+      <p><span class="pill run">试写轮次进行中</span></p>
+      <div class="kv">
+        <b>可撤销字节位置</b>
+        <div>{{ tro.undo_positions }} / {{ tro.position_limit }}（同一位置反复试写只算一次）</div>
+        <b>另存试写/还原数据</b>
+        <div>{{ tro.stored_bytes }} / {{ tro.stored_budget_bytes }} 字节（上限 4 KiB）</div>
+        <b>有试写的块</b>
+        <div>
+          {% if tro.blocks %}
+            {% for b in tro.blocks %}LBN {{ b.lbn }}（{{ b.positions }} 处）{% if not loop.last %}；{% endif %}{% endfor %}
+          {% else %}暂无{% endif %}
+        </div>
+      </div>
+      <form method="post" action="{{ url_for('trial_patch_page') }}" style="margin-top:10px">
+        <input type="number" name="lbn" min="0" max="31" placeholder="LBN" required>
+        <textarea name="patches" rows="3" style="width:100%;font-family:ui-monospace,Menlo,monospace;font-size:12px;padding:6px;border:1px solid var(--bd);border-radius:6px"
+          placeholder="每行一个补丁：字节偏移:十六进制，例如&#10;0:deadbeef&#10;100:01ff"></textarea>
+        <button type="submit">提交试写补丁</button>
+      </form>
+      <p class="note">补丁按 LBN 与字节偏移提交；提交后该块原入口（盘槽或临时槽）立即读到新值。超额或非法补丁整笔拒绝、本轮不变。</p>
+      <form method="post" action="{{ url_for('trial_finalize_page') }}">
+        <button type="submit" name="action" value="confirm">整轮确认（保留试写值）</button>
+        <button class="danger" type="submit" name="action" value="revoke">整轮撤销（恢复原字节）</button>
+      </form>
+      <p class="note">确认/撤销只处理仍有试写的块，每块正文最多写一次；进程重启后未结束的一轮仍可续写、确认或撤销。</p>
+    {% else %}
+      <p><span class="pill idle">没有进行中的试写轮次</span>（每次只开一轮，确认或撤销后才能再开）</p>
+      <form method="post" action="{{ url_for('trial_open_page') }}">
+        <button type="submit">开启一轮试写</button>
+      </form>
+      {% if tr.last_finalize %}
+        {% set lf = tr.last_finalize %}
+        <div class="kv" style="margin-top:10px">
+          <b>最近一次收尾</b>
+          <div>{{ '确认' if lf.action == 'confirm' else '撤销' }} · {{ lf.ts }} ·
+            涉及 {{ lf.affected_blocks }} 块 ·
+            正文实写 {{ lf.body_writes }} 次（盘槽 {{ lf.disk_writes }}、临时槽 {{ lf.staging_writes }}）·
+            {{ lf.positions }} 个字节位置</div>
+        </div>
+      {% endif %}
+    {% endif %}
   </div>
 </div>
 
@@ -153,7 +201,7 @@
 <table>
   <thead><tr>
     <th>LBN</th><th>当前盘</th><th>当前槽</th><th>位置状态</th>
-    <th>目标盘（k={{ state.stripe_k }}）</th><th>目标槽</th><th>是否到位</th><th>最近一批写入次数</th>
+    <th>目标盘（k={{ state.stripe_k }}）</th><th>目标槽</th><th>是否到位</th><th>试写位置数</th><th>最近一批写入次数</th>
   </tr></thead>
   <tbody>
   {% for b in state.blocks %}
@@ -165,6 +213,7 @@
       <td>{{ b.expected_disk }}</td>
       <td>{{ b.expected_slot }}</td>
       <td>{% if b.at_target %}✓{% else %}<span style="color:var(--warn)">待搬</span>{% endif %}</td>
+      <td>{% if b.trial_positions %}<b style="color:var(--warn)">{{ b.trial_positions }}</b>{% else %}0{% endif %}</td>
       <td>{{ mig.last_writes if mig else 0 }}</td>
     </tr>
   {% endfor %}

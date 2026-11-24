@@ -28,6 +28,7 @@ from __future__ import annotations
 import os
 import sqlite3
 
+from . import trial
 from .db import BLOCK_COUNT, DISK_COUNT, SLOTS_PER_DISK
 
 
@@ -338,15 +339,20 @@ def write_lbn(conn: sqlite3.Connection, lbn: int, body: bytes) -> dict:
                 (body, loc["disk"], loc["slot"]),
             )
             where = f"disk{loc['disk']}.slot{loc['slot']}"
+        # A successful full-block overwrite supersedes any prior trial bytes of
+        # this block: its undo log is dropped and the quota is released.
+        invalidated = trial.invalidate_lbn(conn, lbn)
         conn.execute(
             "INSERT INTO events(kind, detail) VALUES ('host_write', ?)",
-            (f"lbn={lbn} overwrite committed at {where}",),
+            (f"lbn={lbn} overwrite committed at {where}"
+             + (f"; {invalidated} trial position(s) superseded" if invalidated else ""),),
         )
         conn.execute("COMMIT")
     except Exception:
         conn.execute("ROLLBACK")
         raise
-    return {"lbn": lbn, "target": where, "committed": True}
+    return {"lbn": lbn, "target": where, "committed": True,
+            "trial_positions_invalidated": invalidated}
 
 
 # --------------------------------------------------------------------------- #
@@ -401,6 +407,32 @@ def verify(conn: sqlite3.Connection) -> dict:
                     f"lbn {lbn} at disk{loc['disk']}.slot{loc['slot']} "
                     f"staged={loc['staged']}, expected disk{exp_d}.slot{exp_s}"
                 )
+
+    # Trial-round invariants: counters match the undo log, distinct positions
+    # stay within the 4096 quota, undo rows point at existing blocks/offsets,
+    # and every undo byte is exactly one byte (stored payload <= 4 KiB).
+    trow = conn.execute("SELECT * FROM trial_round WHERE id = 1").fetchone()
+    distinct = conn.execute(
+        "SELECT COUNT(*) AS c, COALESCE(SUM(length(orig_byte)), 0) AS b"
+        " FROM trial_bytes"
+    ).fetchone()
+    if trow is None and distinct["c"]:
+        errors.append("trial bytes exist without an open trial round")
+    if trow is not None:
+        if trow["undo_positions"] != distinct["c"]:
+            errors.append(
+                f"trial round counter {trow['undo_positions']} != "
+                f"distinct undo rows {distinct['c']}")
+        if distinct["c"] > 4096:
+            errors.append(f"undoable positions {distinct['c']} exceed 4096 quota")
+        if distinct["b"] > 4096:
+            errors.append(f"stored undo payload {distinct['b']} B exceeds 4 KiB")
+        bad = conn.execute(
+            "SELECT COUNT(*) AS c FROM trial_bytes WHERE lbn NOT IN"
+            " (SELECT lbn FROM locations) OR offset < 0 OR offset >= 4096"
+        ).fetchone()["c"]
+        if bad:
+            errors.append(f"{bad} trial undo rows reference invalid lbn/offset")
     return {"ok": not errors, "errors": errors, "stripe_k": stripe_k}
 
 
@@ -408,6 +440,11 @@ def snapshot(conn: sqlite3.Connection) -> dict:
     mig = conn.execute("SELECT * FROM migration WHERE id = 1").fetchone()
     stripe_k = mig["stripe_k"] if mig else 1
     loc_rows = conn.execute("SELECT * FROM locations ORDER BY lbn").fetchall()
+    trial_counts = {
+        r["lbn"]: r["n"]
+        for r in conn.execute(
+            "SELECT lbn, COUNT(*) AS n FROM trial_bytes GROUP BY lbn")
+    }
     blocks = []
     for loc in loc_rows:
         exp_d, exp_s = new_position(loc["lbn"], stripe_k)
@@ -420,6 +457,7 @@ def snapshot(conn: sqlite3.Connection) -> dict:
             "expected_slot": exp_s,
             "at_target": (loc["disk"], loc["slot"], bool(loc["staged"]))
                           == (exp_d, exp_s, False),
+            "trial_positions": trial_counts.get(loc["lbn"], 0),
         })
     staging = [dict(r) for r in conn.execute("SELECT lbn FROM staging")]
     events = [dict(r) for r in conn.execute(
@@ -431,4 +469,5 @@ def snapshot(conn: sqlite3.Connection) -> dict:
         "staging": staging,
         "events": events,
         "verification": verify(conn),
+        "trial": trial.round_snapshot(conn),
     }
