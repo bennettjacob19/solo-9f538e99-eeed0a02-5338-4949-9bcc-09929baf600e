@@ -1,0 +1,13 @@
+services:
+  virtual-volume:
+    build: .
+    image: virtual-volume-striping:latest
+    container_name: virtual-volume-striping
+    ports:
+      - "8000:8000"
+    volumes:
+      - volume-data:/data
+    restart: unless-stopped
+
+volumes:
+  volume-data:

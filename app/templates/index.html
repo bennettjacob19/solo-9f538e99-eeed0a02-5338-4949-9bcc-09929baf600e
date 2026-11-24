@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>虚拟卷在线换条带模拟</title>
+<style>
+  :root { --bd:#d0d7de; --bg:#f6f8fa; --ok:#1a7f37; --err:#cf222e; --warn:#9a6700; }
+  * { box-sizing: border-box; }
+  body { font-family: "Noto Sans CJK SC", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+         margin: 0; padding: 24px; color: #1f2328; background: #fff; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  h2 { font-size: 15px; margin: 18px 0 8px; border-bottom: 1px solid var(--bd); padding-bottom: 4px; }
+  .sub { color: #656d76; font-size: 13px; margin-bottom: 16px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 16px; }
+  .card { border: 1px solid var(--bd); border-radius: 8px; padding: 14px; background: var(--bg); }
+  table { border-collapse: collapse; width: 100%; font-size: 12.5px; background: #fff; }
+  th, td { border: 1px solid var(--bd); padding: 4px 8px; text-align: center; }
+  th { background: var(--bg); }
+  form { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 6px 0; }
+  input[type=number], input[type=text], select { padding: 5px 8px; border: 1px solid var(--bd); border-radius: 6px; font-size: 13px; }
+  input[type=text] { min-width: 260px; }
+  button { padding: 6px 14px; border: 1px solid rgba(31,35,40,.15); border-radius: 6px;
+           background: #1f6feb; color: #fff; font-size: 13px; cursor: pointer; }
+  button.secondary { background: #f6f8fa; color: #1f2328; }
+  button.danger { background: #cf222e; }
+  .flash { padding: 8px 12px; border-radius: 6px; margin: 6px 0; font-size: 13px; }
+  .flash.ok { background: #dafbe1; color: var(--ok); border: 1px solid #aceebb; }
+  .flash.err { background: #ffebe9; color: var(--err); border: 1px solid #ffabaf; }
+  .pill { display: inline-block; padding: 2px 10px; border-radius: 999px; font-size: 12px; font-weight: 600; }
+  .pill.run { background: #fff8c5; color: var(--warn); }
+  .pill.done { background: #dafbe1; color: var(--ok); }
+  .pill.idle { background: #eaeef2; color: #57606a; }
+  .disk { display: grid; grid-template-columns: repeat(8, 1fr); gap: 4px; }
+  .slot { border: 1px solid var(--bd); border-radius: 4px; padding: 4px 2px; font-size: 11px;
+          text-align: center; background: #fff; min-height: 42px; }
+  .slot .lbn { font-weight: 700; font-size: 13px; }
+  .slot .tgt { color: #1f6feb; }
+  .slot.miss { background: #fff0e6; border-style: dashed; color: #bc4c00; }
+  .slot .miss-label { font-weight: 700; }
+  .staged-row { background: #fff8c5; }
+  .muted { color: #656d76; }
+  .kv { display: grid; grid-template-columns: auto 1fr; gap: 4px 14px; font-size: 13px; }
+  .kv b { color: #57606a; font-weight: 600; }
+  .log { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px;
+         max-height: 260px; overflow: auto; background: #fff; border: 1px solid var(--bd); border-radius: 6px; }
+  .log div { padding: 3px 8px; border-bottom: 1px solid #eaeef2; }
+  label.ck { font-size: 13px; display: flex; gap: 4px; align-items: center; }
+  .note { font-size: 12px; color: #656d76; margin: 4px 0 0; }
+</style>
+</head>
+<body>
+<h1>虚拟卷在线换条带模拟台</h1>
+<div class="sub">两块盘 × 每盘 16 槽 × 4 KiB 块；初始单块交替落盘。搬运用单临时槽（最多暂存一块），逐批提交，崩溃后按已提交状态恢复。</div>
+
+{% with messages = get_flashed_messages(with_categories=true) %}
+  {% for category, message in messages %}
+    <div class="flash {{ category }}">{{ message }}</div>
+  {% endfor %}
+{% endwith %}
+
+{% set mig = state.migration %}
+<div class="grid">
+  <div class="card">
+    <h2 style="margin-top:0">迁移状态</h2>
+    <div class="kv">
+      <b>状态</b>
+      <div>
+        {% if not mig %}<span class="pill idle">未开始（条带宽度 1）</span>
+        {% elif mig.status == 'running' %}<span class="pill run">搬运中（目标条带宽度 {{ state.stripe_k }}）</span>
+        {% else %}<span class="pill done">已完成（条带宽度 {{ state.stripe_k }}）</span>{% endif %}
+      </div>
+      <b>进度</b>
+      <div>{% if mig %}{{ mig.next_op }} / {{ mig.total_ops }} 次槽写入（含临时槽写）{% else %}—{% endif %}</div>
+      <b>本批写入次数</b>
+      <div>{% if mig %}{{ mig.last_writes }} 次{% else %}—{% endif %}</div>
+      <b>临时槽</b>
+      <div>{% if state.staging %}暂存 LBN {{ state.staging | map(attribute='lbn') | join(', ') }}（最多 1 块）{% else %}空{% endif %}</div>
+      <b>校验</b>
+      <div>{% if state.verification.ok %}<span style="color:var(--ok)">通过</span>
+        {% else %}<span style="color:var(--err)">{{ state.verification.errors | join('；') }}</span>{% endif %}</div>
+    </div>
+    <p class="note">“本批写入次数”在每批提交后刷新；若在提交前崩溃，重启后该值回退为上一已提交批的计数。</p>
+  </div>
+
+  <div class="card">
+    <h2 style="margin-top:0">操作面板</h2>
+    <form method="post" action="{{ url_for('start') }}">
+      <label>新条带宽度
+        <select name="stripe_k">
+          <option value="2">每 2 块换盘</option>
+          <option value="4">每 4 块换盘</option>
+        </select>
+      </label>
+      <button type="submit">开始换条带</button>
+    </form>
+    <form method="post" action="{{ url_for('batch') }}" id="batchForm">
+      <label>本批最多写几次盘槽正文（临时槽也计次）
+        <input type="number" name="budget" value="1" min="1" max="10000" required>
+      </label>
+      <button type="submit">执行一批并提交</button>
+      <label class="ck"><input type="checkbox" name="crash" value="1">写槽后、提交前退出（模拟崩溃）</label>
+    </form>
+    <p class="note">额度填 1 也会推进一个搬运操作；勾选崩溃后进程退出，页面会自动等待服务重启并刷新。</p>
+    <form method="post" action="{{ url_for('reset') }}">
+      <button class="danger" type="submit">重置卷（恢复初始布局）</button>
+    </form>
+  </div>
+
+  <div class="card">
+    <h2 style="margin-top:0">在线读写（按逻辑块号 LBN 0..31）</h2>
+    <form method="post" action="{{ url_for('read_page') }}">
+      <input type="number" name="lbn" min="0" max="31" placeholder="LBN" required>
+      <button type="submit">读（含暂存块，取最近已提交内容）</button>
+    </form>
+    <form method="post" action="{{ url_for('write_page') }}">
+      <input type="number" name="lbn" min="0" max="31" placeholder="LBN" required>
+      <input type="text" name="body" placeholder="改写正文（不足 4KiB 自动补零，超长截断）">
+      <button type="submit">改写并提交</button>
+    </form>
+    <p class="note">值班员改写独立提交、立即生效，不占用搬运批次的写入额度；即使该块正在临时槽中也能读到最新内容。</p>
+  </div>
+</div>
+
+<h2>盘位图（每盘 16 槽；蓝色数字为新条带下的目标 LBN）</h2>
+<div class="grid">
+  {% for disk in (0, 1) %}
+  <div class="card">
+    <strong>盘 {{ disk }}</strong>
+    <div class="disk" style="margin-top:8px">
+      {% for slot in range(16) %}
+        {% set occupant = state.blocks | selectattr('disk','equalto',disk) | selectattr('slot','equalto',slot) | list %}
+        {% set target_lbn = (slot * 2 + disk) if state.stripe_k == 1 else None %}
+        {% if occupant %}
+          {% set b = occupant[0] %}
+          <div class="slot {% if b.staged %}staged-row{% endif %}">
+            <div class="lbn">L{{ b.lbn }}{% if b.staged %} ⚠{% endif %}</div>
+            <div class="tgt">目标 L{{ target_at[(disk, slot)] }}</div>
+            <div class="muted">槽{{ slot }}{% if b.at_target %} ✓{% endif %}</div>
+          </div>
+        {% else %}
+          <div class="slot miss"><div class="miss-label">空槽</div>
+            <div class="tgt">目标 L{{ target_at[(disk, slot)] }}</div><div class="muted">槽{{ slot }}</div></div>
+        {% endif %}
+      {% endfor %}
+    </div>
+  </div>
+  {% endfor %}
+</div>
+<p class="note">⚠ 表示该槽位上的块正暂存于临时槽（同一时刻最多一块）；空槽是环搬运过程中的“洞”，属于正常中间态。</p>
+
+<h2>逻辑块明细（当前盘位 / 本批写入次数）</h2>
+<table>
+  <thead><tr>
+    <th>LBN</th><th>当前盘</th><th>当前槽</th><th>位置状态</th>
+    <th>目标盘（k={{ state.stripe_k }}）</th><th>目标槽</th><th>是否到位</th><th>最近一批写入次数</th>
+  </tr></thead>
+  <tbody>
+  {% for b in state.blocks %}
+    <tr {% if b.staged %}class="staged-row"{% endif %}>
+      <td>{{ b.lbn }}</td>
+      <td>{% if b.staged %}—（临时槽）{% else %}{{ b.disk }}{% endif %}</td>
+      <td>{% if b.staged %}—{% else %}{{ b.slot }}{% endif %}</td>
+      <td>{% if b.staged %}临时槽暂存中{% else %}盘上{% endif %}</td>
+      <td>{{ b.expected_disk }}</td>
+      <td>{{ b.expected_slot }}</td>
+      <td>{% if b.at_target %}✓{% else %}<span style="color:var(--warn)">待搬</span>{% endif %}</td>
+      <td>{{ mig.last_writes if mig else 0 }}</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+
+<h2>事件日志（最近 25 条）</h2>
+<div class="log">
+  {% for e in state.events %}
+    <div><span class="muted">{{ e.ts }}</span> <b>[{{ e.kind }}]</b> {{ e.detail }}</div>
+  {% endfor %}
+</div>
+
+<script>
+// 模拟崩溃时服务进程直接退出，fetch/表单会失败：轮询等待重启后刷新页面。
+document.getElementById('batchForm').addEventListener('submit', function (ev) {
+  var crash = this.querySelector('input[name=crash]').checked;
+  if (!crash) return;
+  ev.preventDefault();
+  fetch(this.action, { method: 'POST', body: new FormData(this) }).catch(function () {});
+  var tries = 0;
+  var timer = setInterval(function () {
+    fetch('/api/snapshot').then(function (r) {
+      if (r.ok) { clearInterval(timer); window.location.reload(); }
+    }).catch(function () {
+      if (++tries > 60) clearInterval(timer);
+    });
+  }, 1000);
+});
+</script>
+</body>
+</html>
